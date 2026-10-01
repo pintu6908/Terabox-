@@ -19,35 +19,89 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# Supported TeraBox domains
+# Expanded list of TeraBox domains & mirrors
 TERABOX_DOMAINS = [
-    "terabox.com", "1024terabox.com", "teraboxapp.com",
-    "freeterabox.com", "mirrobox.com", "neobox.com", "dubox.com"
+    "terabox", "1024terabox", "teraboxapp", "freeterabox", 
+    "mirrobox", "neobox", "dubox", "terasharelink", 
+    "momolee", "tibimbox", "gibimbox"
 ]
 
+# Multiple API endpoints for fallback redundancy
+API_ENDPOINTS = [
+    "https://terabox-dl.qtls.workers.dev/?url={}",
+    "https://terabox-downloader-api.vercel.app/api?url={}",
+    "https://api.teraboxdownloader.workers.dev/?url={}"
+]
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json"
+}
+
 def extract_url(text: str) -> str | None:
-    """Extracts the first valid TeraBox link found in text."""
+    """Extracts any valid TeraBox or mirror URL from the text."""
     urls = re.findall(r"https?://[^\s]+", text)
     for url in urls:
-        if any(domain in url for domain in TERABOX_DOMAINS):
+        url_lower = url.lower()
+        if any(domain in url_lower for domain in TERABOX_DOMAINS):
             return url
     return None
 
-def fetch_terabox_media(url: str) -> dict | None:
-    """Queries public parsing endpoint for media stream & download links."""
-    api_url = f"https://terabox-dl.qtls.workers.dev/?url={url}"
-    try:
-        response = requests.get(api_url, timeout=15)
-        if response.status_code == 200:
-            return response.json()
-    except Exception as e:
-        logging.error(f"API Error: {e}")
-    return None
+def parse_api_response(data: dict) -> tuple[str | None, str | None, str]:
+    """Dynamically locates download link, stream link, and file name across different API structures."""
+    if not isinstance(data, dict):
+        return None, None, "TeraBox_Video.mp4"
+
+    # Extract download URL across common keys
+    download_url = (
+        data.get("download_url") or 
+        data.get("downloadLink") or 
+        data.get("direct_link") or 
+        data.get("dlink") or
+        data.get("url")
+    )
+    
+    # Handle nested data payloads if present
+    if not download_url and "data" in data and isinstance(data["data"], dict):
+        nested = data["data"]
+        download_url = nested.get("download_url") or nested.get("dlink") or nested.get("url")
+
+    # Extract stream URL
+    stream_url = data.get("stream_url") or download_url
+
+    # Extract file name
+    file_name = (
+        data.get("file_name") or 
+        data.get("filename") or 
+        data.get("title") or 
+        "TeraBox_Video.mp4"
+    )
+
+    return download_url, stream_url, file_name
+
+def fetch_terabox_media(url: str) -> tuple[str | None, str | None, str]:
+    """Cycles through multiple fallback APIs until one successfully resolves the link."""
+    for endpoint in API_ENDPOINTS:
+        try:
+            api_url = endpoint.format(url)
+            logging.info(f"Attempting API: {api_url}")
+            response = requests.get(api_url, headers=HEADERS, timeout=12)
+            
+            if response.status_code == 200:
+                data = response.json()
+                dl_url, st_url, filename = parse_api_response(data)
+                if dl_url:
+                    return dl_url, st_url, filename
+        except Exception as e:
+            logging.warning(f"Endpoint failed ({endpoint}): {e}")
+            continue
+
+    return None, None, "TeraBox_Video.mp4"
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         "👋 **Welcome to TeraBox Streamer & Downloader Bot!**\n\n"
-        "Send me any valid TeraBox video link, and I will generate instant links "
+        "Send me any TeraBox video link, and I will generate instant links "
         "for **online streaming** and **direct downloading**."
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
@@ -57,31 +111,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     terabox_url = extract_url(user_text)
 
     if not terabox_url:
-        await update.message.reply_text("❌ Please send a valid TeraBox link.")
+        await update.message.reply_text(
+            "❌ **Invalid Link.** Please send a valid TeraBox link (e.g., `terabox.com`, `1024terabox.com`, `teraboxapp.com`).",
+            parse_mode="Markdown"
+        )
         return
 
-    status_msg = await update.message.reply_text("🔎 Processing link, please wait...")
+    status_msg = await update.message.reply_text("🔎 Processing link across fallback servers, please wait...")
 
-    media_data = fetch_terabox_media(terabox_url)
+    download_url, stream_url, file_name = fetch_terabox_media(terabox_url)
 
-    if not media_data or "download_url" not in media_data:
-        await status_msg.edit_text("⚠️ Could not process this TeraBox link. It may be private or expired.")
+    if not download_url:
+        await status_msg.edit_text(
+            "⚠️ **Processing Failed.** The link might be password-protected, contain a folder instead of a single video, or be expired."
+        )
         return
-
-    file_name = media_data.get("file_name", "TeraBox_Video.mp4")
-    download_url = media_data.get("download_url")
-    stream_url = media_data.get("stream_url", download_url)
 
     buttons = [
-        [InlineKeyboardButton("▶️️ Watch Online", url=stream_url)],
+        [InlineKeyboardButton("▶ Watch Online", url=stream_url)],
         [InlineKeyboardButton("⬇️ Direct Download", url=download_url)]
     ]
     reply_markup = InlineKeyboardMarkup(buttons)
 
     caption = (
         f"🎬 **File Name:** `{file_name}`\n\n"
-        f"• **Watch Online:** Stream directly in your web browser.\n"
-        f"• **Direct Download:** Fast direct MP4 download."
+        f"• **Watch Online:** Stream directly in your browser.\n"
+        f"• **Direct Download:** Download full file directly."
     )
 
     await status_msg.edit_text(caption, reply_markup=reply_markup, parse_mode="Markdown")
@@ -91,7 +146,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot is starting...")
+    print("Bot is active and listening...")
     app.run_polling()
 
 if __name__ == "__main__":
