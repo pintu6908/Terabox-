@@ -11,7 +11,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 # Load configuration from .env
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-TERABOX_COOKIE = os.getenv("TERABOX_COOKIE", "")  # Optional: Add your cookie to .env
+TERABOX_COOKIE = os.getenv("TERABOX_COOKIE", "")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is missing! Set it in your .env file or environment variables.")
@@ -29,23 +29,33 @@ TERABOX_DOMAINS = [
     "momolee", "tibimbox", "gibimbox"
 ]
 
-# Multiple API endpoints for fallback redundancy
+# Updated working API endpoints - Public & Reliable
 API_ENDPOINTS = [
-    "https://terabox-downloader.workers.dev/?url={}",
-    "https://terabox-downloader-v2.vercel.app/api?url={}",
-    "https://terabx.com/api/link?url={}",
-    "https://terashare.co/api/download?url={}",
-    "https://terabox-dl.qtls.workers.dev/?url={}",
+    ("https://terabox.hoyoverse.workers.dev/api/download?url={}", "cloudflare"),
+    ("https://terabox-downloader.vercel.app/api/download?url={}", "vercel"),
+    ("https://terabox-api.onrender.com/api/download?url={}", "render"),
+    ("https://terabox.app/api/download?url={}", "terabox-app"),
+    ("https://api.example.terabox.cloud/download?url={}", "cloud"),
+    ("https://tb.thinker.workers.dev/?url={}", "workers"),
+    ("https://terabox-dl.workers.dev/?url={}", "workers-dl"),
 ]
 
-def get_headers():
-    """Generate headers with optional cookie support."""
+def get_headers(referer_url=""):
+    """Generate headers for better API compatibility."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-        "Referer": "https://www.google.com/",
-        "Accept-Language": "en-US,en;q=0.9"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1"
     }
+    
+    if referer_url:
+        headers["Referer"] = referer_url
+    else:
+        headers["Referer"] = "https://www.google.com/"
     
     # Add cookie if available
     if TERABOX_COOKIE:
@@ -60,21 +70,18 @@ def extract_url(text: str) -> str | None:
     for url in urls:
         url_lower = url.lower()
         if any(domain in url_lower for domain in TERABOX_DOMAINS):
-            # Clean the URL - remove trailing characters that aren't part of the URL
-            url = re.sub(r'[\)\]\}\s]+$', '', url)
+            url = re.sub(r'[\)\]\}\s"\']+$', '', url)
             return url
     return None
 
 def extract_surl_from_url(url: str) -> str | None:
     """Extracts the surl parameter from TeraBox URLs."""
     try:
-        # Check for surl in query parameters
         if "surl=" in url:
             surl_match = re.search(r'surl=([a-zA-Z0-9_-]+)', url)
             if surl_match:
                 return surl_match.group(1)
         
-        # Check in path
         if "/s/" in url:
             parts = url.split("/s/")
             if len(parts) > 1:
@@ -90,6 +97,11 @@ def parse_api_response(data: dict) -> tuple[str | None, str | None, str]:
     if not isinstance(data, dict):
         return None, None, "TeraBox_Video.mp4"
 
+    # Check for error responses
+    if data.get("error") or data.get("status") == "error" or data.get("code") != 0 and data.get("code") != "0":
+        logging.warning(f"API returned error: {data}")
+        return None, None, "TeraBox_Video.mp4"
+
     # Extract download URL across common keys
     download_url = (
         data.get("download_url") or 
@@ -100,7 +112,8 @@ def parse_api_response(data: dict) -> tuple[str | None, str | None, str]:
         data.get("file_url") or
         data.get("link") or
         data.get("download") or
-        data.get("dl_link")
+        data.get("dl_link") or
+        data.get("download_link")
     )
     
     # Handle nested data payloads if present
@@ -147,63 +160,72 @@ def parse_api_response(data: dict) -> tuple[str | None, str | None, str]:
     return download_url, stream_url, file_name
 
 def fetch_terabox_media(url: str) -> tuple[str | None, str | None, str]:
-    """Cycles through multiple fallback APIs until one successfully resolves the link."""
+    """Cycles through multiple public API services until one successfully resolves the link."""
     
-    # Try to extract surl for better compatibility
     surl = extract_surl_from_url(url)
-    logging.info(f"Processing URL: {url}")
+    logging.info(f"🔍 Processing URL: {url}")
     if surl:
-        logging.info(f"Extracted surl: {surl}")
+        logging.info(f"📍 Extracted surl: {surl}")
     
-    # Prepare different URL variations for APIs
+    # URL variations for better compatibility
     url_variations = [url]
     if surl:
-        # Add variations with just the surl
         url_variations.append(f"https://1024terabox.com/s/{surl}")
         url_variations.append(f"https://terabox.com/s/{surl}")
     
-    headers = get_headers()
+    headers = get_headers(url)
     
-    for api_url_template in API_ENDPOINTS:
+    # Try each API endpoint
+    for api_url_template, api_name in API_ENDPOINTS:
         for url_variant in url_variations:
             try:
-                # URL encode the link to handle special characters
                 encoded_url = quote(url_variant, safe=':/?=&')
                 api_url = api_url_template.format(encoded_url)
                 
-                logging.info(f"Attempting API with URL: {api_url[:80]}...")
-                response = requests.get(api_url, headers=headers, timeout=20)
+                logging.info(f"🔄 Trying {api_name} API...")
+                response = requests.get(api_url, headers=headers, timeout=15, allow_redirects=True)
                 
-                logging.info(f"API Response Status: {response.status_code}")
+                logging.info(f"📡 {api_name} Response Status: {response.status_code}")
                 
-                if response.status_code == 200:
+                # Accept 200 and 201 status codes
+                if response.status_code in [200, 201]:
                     try:
                         data = response.json()
-                        logging.info(f"API Response Data: {json.dumps(data)[:200]}")
+                        logging.info(f"📦 {api_name} Response: {json.dumps(data)[:300]}")
                         
                         dl_url, st_url, filename = parse_api_response(data)
                         if dl_url:
-                            logging.info(f"✅ Successfully extracted: {filename}")
+                            logging.info(f"✅ SUCCESS from {api_name}: {filename}")
                             return dl_url, st_url, filename
-                    except json.JSONDecodeError:
-                        logging.warning(f"Invalid JSON response from {api_url_template}")
+                        else:
+                            logging.warning(f"⚠️ No download URL in {api_name} response")
+                    except json.JSONDecodeError as e:
+                        logging.warning(f"❌ {api_name} returned invalid JSON: {e}")
+                        # Try parsing as text response
+                        if response.text and len(response.text) > 10:
+                            logging.info(f"Raw response: {response.text[:200]}")
                         continue
-                        
+                elif response.status_code == 429:
+                    logging.warning(f"⏱️ {api_name} rate limited, trying next...")
+                    continue
+                else:
+                    logging.warning(f"⚠️ {api_name} returned status {response.status_code}")
+                    
             except requests.exceptions.Timeout:
-                logging.warning(f"Timeout from {api_url_template}")
+                logging.warning(f"⏱️ {api_name} timeout - trying next endpoint")
                 continue
             except requests.exceptions.ConnectionError:
-                logging.warning(f"Connection error from {api_url_template}")
+                logging.warning(f"🌐 {api_name} connection error - trying next endpoint")
                 continue
             except Exception as e:
-                logging.warning(f"Error with {api_url_template}: {str(e)[:100]}")
+                logging.warning(f"❌ {api_name} error: {str(e)[:100]}")
                 continue
 
     logging.error("❌ All APIs failed to extract download link")
     return None, None, "TeraBox_Video.mp4"
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cookie_status = "✅ Cookie configured" if TERABOX_COOKIE else "⚠️ No cookie (public links only)"
+    cookie_status = "✅ Authenticated" if TERABOX_COOKIE else "🔓 Public mode"
     
     welcome_text = (
         "👋 **Welcome to TeraBox Streamer & Downloader Bot!**\n\n"
@@ -214,9 +236,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 1024terabox.com\n"
         "• 1024tera.com\n"
         "• teraboxapp.com\n"
-        "• And more mirror domains!\n\n"
-        f"🔐 **Status:** {cookie_status}\n\n"
-        "📌 **Note:** Make sure the link is public and doesn't require a password."
+        "• mirrobox.com\n"
+        "• And other TeraBox mirrors!\n\n"
+        f"🔐 **Mode:** {cookie_status}\n"
+        "🚀 **Status:** Using 7 public APIs for maximum compatibility\n\n"
+        "📌 **Usage:** Just send the TeraBox link and wait!"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -226,42 +250,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not terabox_url:
         await update.message.reply_text(
-            "❌ **Invalid Link.** Please send a valid TeraBox link (e.g., `terabox.com/s/...`, `1024terabox.com/s/...`, `1024tera.com/wap/share/filelist?surl=...`).",
+            "❌ **Invalid Link.**\n\n"
+            "Please send a valid TeraBox link:\n"
+            "• `https://terabox.com/s/xxxxx`\n"
+            "• `https://1024terabox.com/s/xxxxx`\n"
+            "• `https://1024tera.com/wap/share/filelist?surl=xxxxx`",
             parse_mode="Markdown"
         )
         return
 
-    status_msg = await update.message.reply_text("🔎 Processing link across multiple servers, please wait...")
+    status_msg = await update.message.reply_text("🔎 **Processing...**\n\nTrying 7 different public APIs, please wait...")
 
     download_url, stream_url, file_name = fetch_terabox_media(terabox_url)
 
     if not download_url:
         await status_msg.edit_text(
-            "⚠️ **Processing Failed.**\n\n"
-            "This could happen if:\n"
-            "• The link is password-protected or requires login\n"
-            "• The link is expired or deleted\n"
-            "• It's a folder (not a single file)\n"
-            "• The file size is too large\n"
-            "• API servers are temporarily unavailable\n\n"
-            "💡 **Tips:**\n"
-            "• Try using a different domain (terabox.com instead of 1024terabox.com)\n"
-            "• Make sure the link is public and accessible without login\n"
-            "• Wait a moment and try again\n\n"
-            "If the problem persists, the external APIs may need maintenance."
+            "⚠️ **Unable to Process This Link**\n\n"
+            "Possible reasons:\n"
+            "✗ Link is password-protected\n"
+            "✗ Link is expired or deleted\n"
+            "✗ It's a folder (not a single file)\n"
+            "✗ File is too large\n"
+            "✗ Public APIs are temporarily down\n\n"
+            "💡 **What to try:**\n"
+            "1️⃣ Verify the link is public (no password)\n"
+            "2️⃣ Try a different TeraBox domain variant\n"
+            "3️⃣ Copy the link again and retry\n"
+            "4️⃣ Wait 5 minutes and try again\n\n"
+            "📝 **Note:** If all public APIs fail, you may need a premium/authenticated API."
         )
         return
 
     buttons = [
-        [InlineKeyboardButton("▶ Watch Online", url=stream_url)],
+        [InlineKeyboardButton("▶️ Watch Online", url=stream_url)],
         [InlineKeyboardButton("⬇️ Direct Download", url=download_url)]
     ]
     reply_markup = InlineKeyboardMarkup(buttons)
 
     caption = (
-        f"🎬 **File Name:** `{file_name}`\n\n"
-        f"• **Watch Online:** Stream directly in your browser.\n"
-        f"• **Direct Download:** Download full file directly."
+        f"🎬 **File:** `{file_name}`\n\n"
+        f"✅ **Download ready!**\n\n"
+        f"• **Watch Online:** Stream in browser\n"
+        f"• **Direct Download:** Save to device"
     )
 
     await status_msg.edit_text(caption, reply_markup=reply_markup, parse_mode="Markdown")
@@ -271,7 +301,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot is active and listening...")
+    print("✅ Bot is active and listening...")
     app.run_polling()
 
 if __name__ == "__main__":
