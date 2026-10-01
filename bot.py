@@ -2,7 +2,8 @@ import logging
 import os
 import re
 import requests
-from urllib.parse import quote
+import json
+from urllib.parse import quote, urlparse, parse_qs
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -29,16 +30,18 @@ TERABOX_DOMAINS = [
 
 # Multiple API endpoints for fallback redundancy
 API_ENDPOINTS = [
+    "https://terabox-downloader.workers.dev/?url={}",
+    "https://terabox-downloader-v2.vercel.app/api?url={}",
+    "https://terabx.com/api/link?url={}",
+    "https://terashare.co/api/download?url={}",
     "https://terabox-dl.qtls.workers.dev/?url={}",
-    "https://terabox-downloader-api.vercel.app/api?url={}",
-    "https://api.teraboxdownloader.workers.dev/?url={}",
-    "https://www.terabox-downloader.workers.dev/?url={}"
 ]
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json",
-    "Referer": "https://www.google.com/"
+    "Referer": "https://www.google.com/",
+    "Accept-Language": "en-US,en;q=0.9"
 }
 
 def extract_url(text: str) -> str | None:
@@ -47,7 +50,29 @@ def extract_url(text: str) -> str | None:
     for url in urls:
         url_lower = url.lower()
         if any(domain in url_lower for domain in TERABOX_DOMAINS):
+            # Clean the URL - remove trailing characters that aren't part of the URL
+            url = re.sub(r'[\)\]\}\s]+$', '', url)
             return url
+    return None
+
+def extract_surl_from_url(url: str) -> str | None:
+    """Extracts the surl parameter from TeraBox URLs."""
+    try:
+        # Check for surl in query parameters
+        if "surl=" in url:
+            surl_match = re.search(r'surl=([a-zA-Z0-9_-]+)', url)
+            if surl_match:
+                return surl_match.group(1)
+        
+        # Check in path
+        if "/s/" in url:
+            parts = url.split("/s/")
+            if len(parts) > 1:
+                surl = parts[1].split("?")[0].split("&")[0]
+                return surl if surl else None
+    except Exception as e:
+        logging.error(f"Error extracting surl: {e}")
+    
     return None
 
 def parse_api_response(data: dict) -> tuple[str | None, str | None, str]:
@@ -63,7 +88,9 @@ def parse_api_response(data: dict) -> tuple[str | None, str | None, str]:
         data.get("dlink") or
         data.get("url") or
         data.get("file_url") or
-        data.get("link")
+        data.get("link") or
+        data.get("download") or
+        data.get("dl_link")
     )
     
     # Handle nested data payloads if present
@@ -75,7 +102,8 @@ def parse_api_response(data: dict) -> tuple[str | None, str | None, str]:
                 nested.get("dlink") or 
                 nested.get("url") or 
                 nested.get("file_url") or
-                nested.get("link")
+                nested.get("link") or
+                nested.get("download")
             )
         elif isinstance(nested, list) and len(nested) > 0:
             if isinstance(nested[0], dict):
@@ -84,11 +112,17 @@ def parse_api_response(data: dict) -> tuple[str | None, str | None, str]:
                     nested[0].get("dlink") or 
                     nested[0].get("url") or
                     nested[0].get("file_url") or
-                    nested[0].get("link")
+                    nested[0].get("link") or
+                    nested[0].get("download")
                 )
 
     # Extract stream URL
-    stream_url = data.get("stream_url") or download_url
+    stream_url = (
+        data.get("stream_url") or 
+        data.get("video_url") or 
+        data.get("play_url") or
+        download_url
+    )
 
     # Extract file name
     file_name = (
@@ -96,6 +130,7 @@ def parse_api_response(data: dict) -> tuple[str | None, str | None, str]:
         data.get("filename") or 
         data.get("title") or 
         data.get("name") or
+        data.get("file") or
         "TeraBox_Video.mp4"
     )
 
@@ -103,35 +138,56 @@ def parse_api_response(data: dict) -> tuple[str | None, str | None, str]:
 
 def fetch_terabox_media(url: str) -> tuple[str | None, str | None, str]:
     """Cycles through multiple fallback APIs until one successfully resolves the link."""
-    # URL encode the link to handle special characters
-    encoded_url = quote(url, safe=':/?=&')
     
-    for endpoint in API_ENDPOINTS:
-        try:
-            api_url = endpoint.format(encoded_url)
-            logging.info(f"Attempting API: {api_url}")
-            response = requests.get(api_url, headers=HEADERS, timeout=15)
-            
-            if response.status_code == 200:
-                data = response.json()
-                logging.info(f"API Response: {data}")
-                dl_url, st_url, filename = parse_api_response(data)
-                if dl_url:
-                    logging.info(f"Successfully extracted: {filename}")
-                    return dl_url, st_url, filename
-        except requests.exceptions.Timeout:
-            logging.warning(f"Endpoint timeout ({endpoint})")
-            continue
-        except requests.exceptions.ConnectionError:
-            logging.warning(f"Connection error ({endpoint})")
-            continue
-        except ValueError as e:
-            logging.warning(f"Invalid JSON from {endpoint}: {e}")
-            continue
-        except Exception as e:
-            logging.warning(f"Endpoint failed ({endpoint}): {e}")
-            continue
+    # Try to extract surl for better compatibility
+    surl = extract_surl_from_url(url)
+    logging.info(f"Processing URL: {url}")
+    if surl:
+        logging.info(f"Extracted surl: {surl}")
+    
+    # Prepare different URL variations for APIs
+    url_variations = [url]
+    if surl:
+        # Add variations with just the surl
+        url_variations.append(f"https://1024terabox.com/s/{surl}")
+        url_variations.append(f"https://terabox.com/s/{surl}")
+    
+    for api_url_template in API_ENDPOINTS:
+        for url_variant in url_variations:
+            try:
+                # URL encode the link to handle special characters
+                encoded_url = quote(url_variant, safe=':/?=&')
+                api_url = api_url_template.format(encoded_url)
+                
+                logging.info(f"Attempting API with URL: {api_url[:80]}...")
+                response = requests.get(api_url, headers=HEADERS, timeout=20)
+                
+                logging.info(f"API Response Status: {response.status_code}")
+                
+                if response.status_code == 200:
+                    try:
+                        data = response.json()
+                        logging.info(f"API Response Data: {json.dumps(data)[:200]}")
+                        
+                        dl_url, st_url, filename = parse_api_response(data)
+                        if dl_url:
+                            logging.info(f"✅ Successfully extracted: {filename}")
+                            return dl_url, st_url, filename
+                    except json.JSONDecodeError:
+                        logging.warning(f"Invalid JSON response from {api_url_template}")
+                        continue
+                        
+            except requests.exceptions.Timeout:
+                logging.warning(f"Timeout from {api_url_template}")
+                continue
+            except requests.exceptions.ConnectionError:
+                logging.warning(f"Connection error from {api_url_template}")
+                continue
+            except Exception as e:
+                logging.warning(f"Error with {api_url_template}: {str(e)[:100]}")
+                continue
 
+    logging.error("❌ All APIs failed to extract download link")
     return None, None, "TeraBox_Video.mp4"
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -144,7 +200,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 1024terabox.com\n"
         "• 1024tera.com\n"
         "• teraboxapp.com\n"
-        "• And more mirror domains!"
+        "• And more mirror domains!\n\n"
+        "📌 **Note:** Make sure the link is public and doesn't require a password."
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -154,12 +211,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not terabox_url:
         await update.message.reply_text(
-            "❌ **Invalid Link.** Please send a valid TeraBox link (e.g., `terabox.com`, `1024terabox.com`, `1024tera.com`).",
+            "❌ **Invalid Link.** Please send a valid TeraBox link (e.g., `terabox.com/s/...`, `1024terabox.com/s/...`, `1024tera.com/wap/share/filelist?surl=...`).",
             parse_mode="Markdown"
         )
         return
 
-    status_msg = await update.message.reply_text("🔎 Processing link across fallback servers, please wait...")
+    status_msg = await update.message.reply_text("🔎 Processing link across multiple servers, please wait...")
 
     download_url, stream_url, file_name = fetch_terabox_media(terabox_url)
 
@@ -167,11 +224,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             "⚠️ **Processing Failed.**\n\n"
             "This could happen if:\n"
-            "• The link is password-protected\n"
+            "• The link is password-protected or requires login\n"
             "• The link is expired or deleted\n"
             "• It's a folder (not a single file)\n"
-            "• API servers are temporarily down\n\n"
-            "Please try again later or check if the link is public and valid."
+            "• The file size is too large\n"
+            "• API servers are temporarily unavailable\n\n"
+            "💡 **Tips:**\n"
+            "• Try using a different domain (terabox.com instead of 1024terabox.com)\n"
+            "• Make sure the link is public and accessible without login\n"
+            "• Wait a moment and try again\n\n"
+            "If the problem persists, the external APIs may need maintenance."
         )
         return
 
