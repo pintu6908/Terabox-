@@ -11,6 +11,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 # Load configuration from .env
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+TERABOX_COOKIE = os.getenv("TERABOX_COOKIE", "")  # Optional: Add your cookie to .env
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is missing! Set it in your .env file or environment variables.")
@@ -37,12 +38,21 @@ API_ENDPOINTS = [
     "https://terabox-dl.qtls.workers.dev/?url={}",
 ]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-    "Referer": "https://www.google.com/",
-    "Accept-Language": "en-US,en;q=0.9"
-}
+def get_headers():
+    """Generate headers with optional cookie support."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Referer": "https://www.google.com/",
+        "Accept-Language": "en-US,en;q=0.9"
+    }
+    
+    # Add cookie if available
+    if TERABOX_COOKIE:
+        headers["Cookie"] = TERABOX_COOKIE
+        logging.info("✅ Using TeraBox cookie for authentication")
+    
+    return headers
 
 def extract_url(text: str) -> str | None:
     """Extracts any valid TeraBox or mirror URL from the text."""
@@ -152,6 +162,8 @@ def fetch_terabox_media(url: str) -> tuple[str | None, str | None, str]:
         url_variations.append(f"https://1024terabox.com/s/{surl}")
         url_variations.append(f"https://terabox.com/s/{surl}")
     
+    headers = get_headers()
+    
     for api_url_template in API_ENDPOINTS:
         for url_variant in url_variations:
             try:
@@ -160,7 +172,7 @@ def fetch_terabox_media(url: str) -> tuple[str | None, str | None, str]:
                 api_url = api_url_template.format(encoded_url)
                 
                 logging.info(f"Attempting API with URL: {api_url[:80]}...")
-                response = requests.get(api_url, headers=HEADERS, timeout=20)
+                response = requests.get(api_url, headers=headers, timeout=20)
                 
                 logging.info(f"API Response Status: {response.status_code}")
                 
@@ -191,6 +203,8 @@ def fetch_terabox_media(url: str) -> tuple[str | None, str | None, str]:
     return None, None, "TeraBox_Video.mp4"
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cookie_status = "✅ Cookie configured" if TERABOX_COOKIE else "⚠️ No cookie (public links only)"
+    
     welcome_text = (
         "👋 **Welcome to TeraBox Streamer & Downloader Bot!**\n\n"
         "Send me any TeraBox video link, and I will generate instant links "
@@ -201,6 +215,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 1024tera.com\n"
         "• teraboxapp.com\n"
         "• And more mirror domains!\n\n"
+        f"🔐 **Status:** {cookie_status}\n\n"
         "📌 **Note:** Make sure the link is public and doesn't require a password."
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
